@@ -109,7 +109,24 @@
         top: 16px;
         left: 16px;
         width: min(420px, calc(100vw - 32px));
+        max-height: calc(100vh - 32px);
+        overflow-y: auto;
         padding: 14px 16px 16px;
+        scrollbar-width: thin;
+        scrollbar-color: rgba(99, 255, 218, 0.25) transparent;
+      }
+
+      .topbar::-webkit-scrollbar {
+        width: 5px;
+      }
+
+      .topbar::-webkit-scrollbar-track {
+        background: transparent;
+      }
+
+      .topbar::-webkit-scrollbar-thumb {
+        background: rgba(99, 255, 218, 0.25);
+        border-radius: 3px;
       }
 
       .handshake {
@@ -488,6 +505,15 @@
               0 peers
             </div>
           </div>
+          <div class="stat">
+            <span class="label">Task Station</span>
+            <div
+              class="value"
+              id="stationStatusLabel"
+            >
+              SCANNING
+            </div>
+          </div>
         </div>
 
         <div class="meter">
@@ -566,8 +592,8 @@
         </div>
 
         <div class="grid2">
-          <button id="toggleStateBtn">Toggle Honest / Hallucinator</button>
-          <button id="copyIdBtn">Copy My ID</button>
+          <button type="button" id="toggleStateBtn">Toggle Honest / Hallucinator</button>
+          <button type="button" id="copyIdBtn">Copy My ID</button>
         </div>
 
         <div
@@ -598,7 +624,7 @@
             placeholder="paste remote peer id"
             autocomplete="off"
           />
-          <button id="connectBtn">Connect</button>
+          <button type="button" id="connectBtn">Connect</button>
         </div>
 
         <div
@@ -678,7 +704,8 @@
       <div class="panel footer">
         <div class="hint">
           <strong>Controls:</strong> WASD = move, Q = toggle Honest / Hallucinator, E = contextual action
-          (stabilize / validate / poison), R = Hallucinator temperature spike, H = toggle HUD.
+          (station / stabilize / validate / poison), R = Hallucinator temperature spike, H = toggle HUD. At stations:
+          E start/sabotage/audit, hold E for HOLD tasks, WASD inputs sequence when active.
         </div>
       </div>
 
@@ -752,6 +779,7 @@
       let peer = null;
       let promptPoisoned = false;
       let lastSessionBroadcast = 0;
+      let lastTaskVersionSent = -1;
       let hudVisible = true;
 
       const ui = {
@@ -767,6 +795,7 @@
         taskLabel: document.getElementById('taskLabel'),
         promptNodeLabel: document.getElementById('promptNodeLabel'),
         connectionsLabel: document.getElementById('connectionsLabel'),
+        stationStatusLabel: document.getElementById('stationStatusLabel'),
         distanceLabel: document.getElementById('distanceLabel'),
         budgetLabel: document.getElementById('budgetLabel'),
         budgetFill: document.getElementById('budgetFill'),
@@ -794,7 +823,19 @@
         nodeUtterance: 'thinking',
         temperatureSpikeUntil: 0,
         lastUtteranceAt: 0,
+        tasksById: {},
+        stationsTask: {},
+        taskSeq: 1,
+        taskVersion: 0,
       };
+
+      const TASK_STATION_RANGE = 2.5;
+      const MIN_FIELD_STATIONS = 2;
+      const centralStationPosition = new THREE.Vector3(3.2, 0.15, 0);
+      const stationVisuals = new Map();
+      let lastTaskGenerationAt = 0;
+      let nextTaskGenerationAt = 0;
+      let lastTaskType = '';
 
       const localPlayer = {
         id: null,
@@ -818,6 +859,21 @@
         activePulse: 0,
         lastActionAt: 0,
         lastSpikeAt: 0,
+        interactHeld: false,
+      };
+
+      function getCssVar(name, fallback) {
+        const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+        return value || fallback;
+      }
+
+      const palette = {
+        honest: getCssVar('--honest', '#63ffda'),
+        traitor: getCssVar('--traitor', '#ff4fd8'),
+        danger: getCssVar('--danger', '#7a2cff'),
+        node: getCssVar('--node', '#9eff6a'),
+        warn: getCssVar('--warn', '#ffb86b'),
+        text: getCssVar('--text', '#d9f7f1'),
       };
 
       function clamp01(value) {
@@ -1025,19 +1081,19 @@
 
            // Horizontal tearing bands that appear stronger in hallucinator mode
            float band = step(0.82, sin(uv.y * 120.0 + uTime * 9.0) * 0.5 + 0.5);
-           float jitter = (hash(vec2(floor(uTime * 18.0), floor(uv.y * 64.0))) - 0.5) * 0.08 * uIntensity * band;
+           float jitter = (hash(vec2(floor(uTime * 18.0), floor(uv.y * 64.0))) - 0.5) * 0.04 * uIntensity * band;
            uv.x += jitter;
 
            vec4 col = texture2D(tDiffuse, uv);
 
            // Light chromatic split + scanline shimmer
-           float scan = sin(vUv.y * 920.0) * 0.03 * uIntensity;
-           col.r += band * 0.06 * uIntensity;
-           col.b -= band * 0.05 * uIntensity;
+           float scan = sin(vUv.y * 920.0) * 0.015 * uIntensity;
+           col.r += band * 0.03 * uIntensity;
+           col.b -= band * 0.025 * uIntensity;
            col.rgb += scan;
 
            // Slight magenta tint for the traitor's view
-           col.rgb *= mix(vec3(1.0), vec3(1.06, 0.94, 1.14), uIntensity * 0.55);
+           col.rgb *= mix(vec3(1.0), vec3(1.03, 0.97, 1.07), uIntensity * 0.4);
 
            gl_FragColor = vec4(col.rgb, 1.0);
          }
@@ -1224,6 +1280,1454 @@
         promptTextTexture.needsUpdate = true;
       }
 
+      function stationIdForBranchIndex(index) {
+        return `branch:${index}`;
+      }
+
+      function parseBranchStationIndex(stationId) {
+        if (!stationId || !stationId.startsWith('branch:')) return -1;
+        const n = Number(stationId.split(':')[1]);
+        return Number.isFinite(n) ? n : -1;
+      }
+
+      function getStationPosition(stationId) {
+        if (stationId === 'central') return centralStationPosition.clone();
+
+        if (stationId.startsWith('field:')) {
+          const fi = Number(stationId.split(':')[1]) || 0;
+          const fieldCount = Math.max(1, MIN_FIELD_STATIONS);
+          const angle = ((fi / fieldCount) * Math.PI * 2) - Math.PI * 0.25;
+          const radius = 10 + fi * 3.5;
+          return new THREE.Vector3(Math.cos(angle) * radius, 0.15, Math.sin(angle) * radius);
+        }
+
+        const branchIndex = parseBranchStationIndex(stationId);
+        if (branchIndex <= 0) return null;
+        const count = getKnownPlayerIds().length || 1;
+        const anchor = getAnchorForIndex(branchIndex, count);
+        const toPrompt = new THREE.Vector3().subVectors(promptNode.position, anchor);
+        toPrompt.y = 0;
+        if (toPrompt.lengthSq() < 0.0001) toPrompt.set(1, 0, 0);
+        toPrompt.normalize();
+        const perp = new THREE.Vector3(-toPrompt.z, 0, toPrompt.x).normalize();
+        const pos = anchor.clone().addScaledVector(perp, 1.5);
+        pos.y = 0.15;
+        return pos;
+      }
+
+      function seqFromSeed(seed, len) {
+        let s = Math.max(1, seed | 0);
+        const out = [];
+        const keysList = ['W', 'A', 'S', 'D'];
+        for (let i = 0; i < len; i++) {
+          s = (s * 16807) % 2147483647;
+          out.push(keysList[s % 4]);
+        }
+        return out;
+      }
+
+      function seededRng(seed) {
+        let s = Math.max(1, seed | 0);
+        return function () {
+          s = (s * 16807) % 2147483647;
+          return (s - 1) / 2147483646;
+        };
+      }
+
+      function gridMoveIndex(index, key, size = 3) {
+        let row = Math.floor(index / size);
+        let col = index % size;
+        if (key === 'W') row = Math.max(0, row - 1);
+        if (key === 'S') row = Math.min(size - 1, row + 1);
+        if (key === 'A') col = Math.max(0, col - 1);
+        if (key === 'D') col = Math.min(size - 1, col + 1);
+        return row * size + col;
+      }
+
+      function packerMetrics(task) {
+        const chunks = task?.data?.chunks || [];
+        const selectedMask = task?.data?.selectedMask || [];
+        let usedTokens = 0;
+        let weightedRel = 0;
+        for (let i = 0; i < chunks.length; i++) {
+          if (!selectedMask[i]) continue;
+          const c = chunks[i];
+          usedTokens += c.size;
+          const rel = c.isPoison ? c.relevance * 0.2 : c.relevance;
+          weightedRel += rel * c.size;
+        }
+        const relevanceScore = usedTokens > 0 ? weightedRel / usedTokens : 0;
+        return { usedTokens, relevanceScore };
+      }
+
+      function l2SqVec3(a, b) {
+        const dx = a[0] - b[0];
+        const dy = a[1] - b[1];
+        const dz = a[2] - b[2];
+        return dx * dx + dy * dy + dz * dz;
+      }
+
+      function shuffleInPlace(arr, rng = Math.random) {
+        for (let i = arr.length - 1; i > 0; i--) {
+          const j = Math.floor(rng() * (i + 1));
+          const t = arr[i];
+          arr[i] = arr[j];
+          arr[j] = t;
+        }
+      }
+
+      function taskTypeLabel(type) {
+        if (type === 'hold') return 'HOLD';
+        if (type === 'sequence') return 'SEQ';
+        if (type === 'gradient') return 'GRADIENT';
+        if (type === 'packer') return 'PACKER';
+        if (type === 'beam') return 'BEAM';
+        if (type === 'embed') return 'EMBED';
+        if (type === 'anneal') return 'ANNEAL';
+        return 'TASK';
+      }
+
+      function getTaskByStation(stationId) {
+        const taskId = sessionState.stationsTask[stationId];
+        return taskId ? sessionState.tasksById[taskId] || null : null;
+      }
+
+      function getStationState(stationId) {
+        const task = getTaskByStation(stationId);
+        if (!task) return 'idle';
+        if (task.phase === 'pending') return 'pending';
+        if (task.phase === 'active') return 'active';
+        if (task.phase === 'completed') return 'completed';
+        if (task.phase === 'failed') return 'failed';
+        return 'idle';
+      }
+
+      function cloneTask(task) {
+        return {
+          ...task,
+          effects: { onComplete: { ...task.effects.onComplete }, onFail: { ...task.effects.onFail } },
+          data: { ...task.data },
+          sabotage: { ...task.sabotage },
+        };
+      }
+
+      function touchTaskVersion() {
+        sessionState.taskVersion += 1;
+      }
+
+      function applyTaskEffects(effects) {
+        if (!effects) return;
+        sessionState.contextBudget = clampPercent(sessionState.contextBudget + (effects.context || 0));
+        sessionState.corruption = clampPercent(sessionState.corruption + (effects.corruption || 0));
+        sessionState.completion = clampPercent(sessionState.completion + (effects.completion || 0));
+      }
+
+      function resolveTask(player, task, outcome) {
+        if (!task) return;
+        if (outcome === 'complete') {
+          const negated = player && player.state === 'hallucinator' && task.type === 'hold';
+          const fx = negated
+            ? {
+                context: -(task.effects.onComplete.context || 0),
+                corruption: Math.abs(task.effects.onComplete.corruption || 0) + 3,
+                completion: -(task.effects.onComplete.completion || 0),
+              }
+            : task.effects.onComplete;
+          applyTaskEffects(fx);
+          task.phase = 'completed';
+        } else {
+          applyTaskEffects(task.effects.onFail);
+          task.phase = 'failed';
+        }
+        task.claimedBy = null;
+        task.claimUntil = 0;
+        if (task.data.startedAt) {
+          task.data.accumMs = (task.data.accumMs || 0) + Math.max(0, Date.now() - task.data.startedAt);
+          task.data.startedAt = 0;
+        }
+        task.resolvedAt = Date.now();
+        touchTaskVersion();
+      }
+
+      function getPlayerById(id) {
+        if (!id) return null;
+        if (id === localPlayer.id) return localPlayer;
+        return remotePlayers.get(id) || null;
+      }
+
+      function getDistanceToStation(player, stationId) {
+        const pos = getStationPosition(stationId);
+        if (!player || !pos) return Number.POSITIVE_INFINITY;
+        return player.mesh.position.distanceTo(pos);
+      }
+
+      function buildTask(stationId, playerCount = 1) {
+        const id = `t${sessionState.taskSeq++}`;
+        const types = ['hold', 'sequence', 'gradient', 'packer', 'beam', 'embed', 'anneal'];
+        const available = types.filter((t) => t !== lastTaskType);
+        const type = available[Math.floor(Math.random() * available.length)];
+        lastTaskType = type;
+        const now = Date.now();
+        const difficulty = Math.max(1, Math.min(4, playerCount));
+        const seed = 1000 + Math.floor(Math.random() * 800000);
+        const rng = seededRng(seed);
+        const basePos = stationId === 'central' ? 1 : 0;
+        const effects = {
+          onComplete: {
+            context: 3 + difficulty + basePos,
+            corruption: -2 - Math.floor(difficulty * 0.5),
+            completion: 6 + difficulty * 2,
+          },
+          onFail: {
+            context: -2 - difficulty,
+            corruption: 3 + difficulty,
+            completion: 0,
+          },
+        };
+        const data =
+          type === 'hold'
+            ? {
+                durationMs: 3000 + Math.floor(Math.random() * 2200) + difficulty * 250,
+                startedAt: 0,
+                accumMs: 0,
+              }
+            : type === 'sequence'
+              ? {
+                  seed,
+                  len: Math.min(7, 4 + Math.floor(Math.random() * 3) + Math.floor(difficulty * 0.5)),
+                  index: 0,
+                  strikes: 0,
+                  maxStrikes: 2,
+                }
+              : type === 'gradient'
+                ? (() => {
+                    const gridSize = 3;
+                    const lossGrid = [];
+                    for (let i = 0; i < gridSize * gridSize; i++) {
+                      lossGrid.push(Number((0.1 + rng() * 0.8).toFixed(3)));
+                    }
+                    let goalIndex = 0;
+                    for (let i = 1; i < lossGrid.length; i++) {
+                      if (lossGrid[i] < lossGrid[goalIndex]) goalIndex = i;
+                    }
+                    const goalRow = Math.floor(goalIndex / gridSize);
+                    const goalCol = goalIndex % gridSize;
+                    const currIndex = (gridSize - 1 - goalRow) * gridSize + (gridSize - 1 - goalCol);
+                    return {
+                      seed,
+                      gridSize,
+                      lossGrid,
+                      goalIndex,
+                      currIndex,
+                      cursorIndex: currIndex,
+                      startIndex: currIndex,
+                      stepsTaken: 0,
+                      requiredSteps: 3 + difficulty,
+                      spikeUsed: false,
+                      noiseSigma: 0,
+                    };
+                  })()
+                : type === 'packer'
+                  ? (() => {
+                      const chunkCount = 4 + Math.floor(rng() * 3);
+                      const chunks = [];
+                      let total = 0;
+                      for (let i = 0; i < chunkCount; i++) {
+                        const size = 30 + Math.floor(rng() * 91);
+                        const relevance = Number((0.2 + rng() * 0.8).toFixed(3));
+                        chunks.push({ size, relevance, isPoison: false });
+                        total += size;
+                      }
+                      const budgetTokens = Math.max(40, Math.floor(total * (0.6 + rng() * 0.1)));
+                      const targetRelevance = Number((0.6 + rng() * 0.2).toFixed(3));
+                      return {
+                        seed,
+                        budgetTokens,
+                        targetRelevance,
+                        chunks,
+                        cursorIndex: 0,
+                        selectedMask: new Array(chunks.length).fill(false),
+                        holdProgress: 0,
+                        lastTickAt: 0,
+                      };
+                    })()
+                  : type === 'beam'
+                    ? (() => {
+                        const depthMax = 3 + Math.floor(rng() * 2);
+                        const candidatesByDepth = [];
+                        const bestIndexByDepth = [];
+                        for (let d = 0; d < depthMax; d++) {
+                          const row = [];
+                          let bestIndex = 0;
+                          for (let i = 0; i < 4; i++) {
+                            row.push(Number((0.1 + rng() * 0.9).toFixed(3)));
+                            if (row[i] > row[bestIndex]) bestIndex = i;
+                          }
+                          candidatesByDepth.push(row);
+                          bestIndexByDepth.push(bestIndex);
+                        }
+                        return {
+                          seed,
+                          depthMax,
+                          depth: 0,
+                          candidatesByDepth,
+                          bestIndexByDepth,
+                          cursorIndex: 0,
+                          strikes: 0,
+                          maxStrikes: 2,
+                          decoyBoosts: {},
+                        };
+                      })()
+                    : type === 'embed'
+                      ? (() => {
+                          const roundsMax = 3;
+                          const rounds = [];
+                          for (let r = 0; r < roundsMax; r++) {
+                            const targetVec = [
+                              Math.floor(rng() * 256),
+                              Math.floor(rng() * 256),
+                              Math.floor(rng() * 256),
+                            ];
+                            const nearestIndex = Math.floor(rng() * 4);
+                            const candidates = [];
+                            for (let i = 0; i < 4; i++) {
+                              if (i === nearestIndex) {
+                                candidates.push([
+                                  Math.max(0, Math.min(255, targetVec[0] + Math.floor((rng() * 2 - 1) * 20))),
+                                  Math.max(0, Math.min(255, targetVec[1] + Math.floor((rng() * 2 - 1) * 20))),
+                                  Math.max(0, Math.min(255, targetVec[2] + Math.floor((rng() * 2 - 1) * 20))),
+                                ]);
+                              } else {
+                                const mkFar = (v) => {
+                                  const sign = rng() < 0.5 ? -1 : 1;
+                                  const mag = 60 + Math.floor(rng() * 120);
+                                  return Math.max(0, Math.min(255, v + sign * mag));
+                                };
+                                candidates.push([mkFar(targetVec[0]), mkFar(targetVec[1]), mkFar(targetVec[2])]);
+                              }
+                            }
+                            candidates[nearestIndex] = [targetVec[0], targetVec[1], targetVec[2]];
+                            rounds.push({ targetVec, candidates });
+                          }
+                          const firstRound = rounds[0] || {
+                            targetVec: [0, 0, 0],
+                            candidates: [
+                              [0, 0, 0],
+                              [0, 0, 0],
+                              [0, 0, 0],
+                              [0, 0, 0],
+                            ],
+                          };
+                          return {
+                            seed,
+                            roundsMax,
+                            round: 0,
+                            rounds,
+                            targetVec: firstRound.targetVec,
+                            candidates: firstRound.candidates,
+                            cursorIndex: 0,
+                            strikes: 0,
+                          };
+                        })()
+                      : {
+                          seed,
+                          temp: 0.5,
+                          driftUpPerSec: Number((0.14 + rng() * 0.12).toFixed(3)),
+                          coolDownPerSec: Number((0.32 + rng() * 0.18).toFixed(3)),
+                          spikeAmount: Number((0.18 + rng() * 0.17).toFixed(3)),
+                          exploreBand: [0.6, 0.85],
+                          lockInBand: [0.15, 0.4],
+                          needExploreMs: 2000,
+                          needLockInMs: 2000,
+                          gotExploreMs: 0,
+                          gotLockInMs: 0,
+                          lastTickAt: 0,
+                        };
+
+        return {
+          id,
+          stationId,
+          type,
+          phase: 'pending',
+          createdAt: now,
+          expiresAt: now + 60000,
+          claimedBy: null,
+          claimUntil: 0,
+          effects,
+          data,
+          sabotage: { level: 0, lastBy: null },
+          flashUntil: 0,
+        };
+      }
+
+      const TASK_TYPES = {
+        hold: {
+          onEvent(task, evt, ctx) {
+            const now = ctx.now;
+            if (evt.type === 'start') {
+              if (task.phase !== 'pending' && task.phase !== 'active') return;
+              if (!task.claimedBy || task.claimedBy === ctx.actor.id || task.claimUntil < now) {
+                task.claimedBy = ctx.actor.id;
+                task.claimUntil = now + 2500;
+                task.phase = 'active';
+                if (!task.data.startedAt && ctx.interactHeld) task.data.startedAt = now;
+                touchTaskVersion();
+              }
+              return;
+            }
+            if (evt.type === 'cancel') {
+              if (task.claimedBy === ctx.actor.id && task.phase === 'active') {
+                if (task.data.startedAt) {
+                  task.data.accumMs += Math.max(0, now - task.data.startedAt);
+                  task.data.startedAt = 0;
+                }
+                task.claimedBy = null;
+                task.claimUntil = 0;
+                task.phase = 'pending';
+                touchTaskVersion();
+              }
+              return;
+            }
+            if (evt.type === 'tick') {
+              if (task.phase !== 'active' || !task.claimedBy) return;
+              const player = getPlayerById(task.claimedBy);
+              const inRange = player && getDistanceToStation(player, task.stationId) <= TASK_STATION_RANGE + 0.15;
+              const held = !!player?.interactHeld;
+              if (!player || !inRange) {
+                if (task.data.startedAt) {
+                  task.data.accumMs += Math.max(0, now - task.data.startedAt);
+                  task.data.startedAt = 0;
+                }
+                task.claimedBy = null;
+                task.claimUntil = 0;
+                task.phase = 'pending';
+                touchTaskVersion();
+                return;
+              }
+              task.claimUntil = now + 1200;
+              if (held && !task.data.startedAt) {
+                task.data.startedAt = now;
+                touchTaskVersion();
+              }
+              if (!held && task.data.startedAt) {
+                task.data.accumMs += Math.max(0, now - task.data.startedAt);
+                task.data.startedAt = 0;
+                touchTaskVersion();
+              }
+              const total = task.data.accumMs + (task.data.startedAt ? now - task.data.startedAt : 0);
+              if (total >= task.data.durationMs) {
+                resolveTask(player, task, 'complete');
+              }
+            }
+          },
+          getRenderInfo(task, player) {
+            const total = task.data.accumMs + (task.data.startedAt ? nowMs - task.data.startedAt : 0);
+            return {
+              progress: clamp01(total / Math.max(1, task.data.durationMs)),
+              isMine: task.claimedBy && task.claimedBy === player?.id,
+              phase: task.phase,
+            };
+          },
+        },
+        sequence: {
+          onEvent(task, evt, ctx) {
+            const now = ctx.now;
+            if (evt.type === 'start') {
+              if (task.phase !== 'pending' && task.phase !== 'active') return;
+              if (!task.claimedBy || task.claimedBy === ctx.actor.id || task.claimUntil < now) {
+                task.claimedBy = ctx.actor.id;
+                task.claimUntil = now + 6000;
+                task.phase = 'active';
+                touchTaskVersion();
+              }
+              return;
+            }
+            if (evt.type === 'cancel') {
+              if (task.claimedBy === ctx.actor.id && task.phase === 'active') {
+                task.phase = 'pending';
+                task.claimedBy = null;
+                task.claimUntil = 0;
+                task.data.index = 0;
+                task.data.strikes = 0;
+                touchTaskVersion();
+              }
+              return;
+            }
+            if (evt.type === 'input') {
+              if (task.phase !== 'active' || task.claimedBy !== ctx.actor.id) return;
+              const seq = seqFromSeed(task.data.seed, task.data.len + task.sabotage.level);
+              const expected = seq[task.data.index];
+              const got = evt.key;
+              task.claimUntil = now + 6000;
+              if (got === expected) {
+                task.data.index += 1;
+                if (task.data.index >= seq.length) {
+                  resolveTask(ctx.actor, task, 'complete');
+                  return;
+                }
+              } else {
+                task.data.strikes += 1;
+                if (task.data.strikes > task.data.maxStrikes) {
+                  resolveTask(ctx.actor, task, 'fail');
+                  return;
+                }
+              }
+              touchTaskVersion();
+              return;
+            }
+            if (evt.type === 'tick' && task.phase === 'active') {
+              const player = getPlayerById(task.claimedBy);
+              if (!player || getDistanceToStation(player, task.stationId) > TASK_STATION_RANGE + 0.6 || task.claimUntil < now) {
+                task.phase = 'pending';
+                task.claimedBy = null;
+                task.claimUntil = 0;
+                task.data.index = 0;
+                task.data.strikes = 0;
+                touchTaskVersion();
+              }
+            }
+          },
+          getRenderInfo(task, player) {
+            const isSabotagedView = player?.state === 'hallucinator' && task.sabotage.level > 0;
+            const baseSeq = seqFromSeed(task.data.seed, task.data.len + task.sabotage.level);
+            const shownSeq = isSabotagedView
+              ? baseSeq.map((k) => {
+                  const keysList = ['W', 'A', 'S', 'D'];
+                  return keysList[(keysList.indexOf(k) + 1) % 4];
+                })
+              : baseSeq;
+            return {
+              phase: task.phase,
+              seq: shownSeq,
+              index: task.data.index,
+              strikes: task.data.strikes,
+              maxStrikes: task.data.maxStrikes,
+              isMine: task.claimedBy && task.claimedBy === player?.id,
+            };
+          },
+        },
+        gradient: {
+          onEvent(task, evt, ctx) {
+            const now = ctx.now;
+            if (evt.type === 'start') {
+              if (task.phase !== 'pending' && task.phase !== 'active') return;
+              if (!task.claimedBy || task.claimedBy === ctx.actor.id || task.claimUntil < now) {
+                task.claimedBy = ctx.actor.id;
+                task.claimUntil = now + 6000;
+                task.phase = 'active';
+                if (typeof task.data.startIndex !== 'number') task.data.startIndex = task.data.currIndex;
+                touchTaskVersion();
+              }
+              return;
+            }
+            if (evt.type === 'cancel') {
+              if (task.claimedBy === ctx.actor.id && task.phase === 'active') {
+                task.phase = 'pending';
+                task.claimedBy = null;
+                task.claimUntil = 0;
+                task.data.currIndex = task.data.startIndex;
+                task.data.cursorIndex = task.data.startIndex;
+                task.data.stepsTaken = 0;
+                task.data.spikeUsed = false;
+                touchTaskVersion();
+              }
+              return;
+            }
+            if (evt.type === 'input') {
+              if (task.phase !== 'active' || task.claimedBy !== ctx.actor.id) return;
+              if (['W', 'A', 'S', 'D'].includes(evt.key)) {
+                task.data.cursorIndex = gridMoveIndex(task.data.cursorIndex, evt.key, task.data.gridSize || 3);
+                task.claimUntil = now + 6000;
+                touchTaskVersion();
+                return;
+              }
+              if (evt.key === 'E_STEP') {
+                const curr = task.data.currIndex;
+                const next = task.data.cursorIndex;
+                const currLoss = task.data.lossGrid[curr];
+                const nextLoss = task.data.lossGrid[next];
+                const isDownhill = nextLoss <= currLoss;
+                if (isDownhill || !task.data.spikeUsed) {
+                  if (!isDownhill) task.data.spikeUsed = true;
+                  task.data.currIndex = next;
+                  task.data.stepsTaken += 1;
+                  task.claimUntil = now + 6000;
+                  if (task.data.stepsTaken >= task.data.requiredSteps) {
+                    resolveTask(ctx.actor, task, 'complete');
+                    return;
+                  }
+                  touchTaskVersion();
+                } else {
+                  resolveTask(ctx.actor, task, 'fail');
+                }
+              }
+              return;
+            }
+            if (evt.type === 'tick') {
+              if (task.phase !== 'active' || !task.claimedBy) return;
+              const player = getPlayerById(task.claimedBy);
+              if (!player || getDistanceToStation(player, task.stationId) > TASK_STATION_RANGE + 0.6 || task.claimUntil < now) {
+                task.phase = 'pending';
+                task.claimedBy = null;
+                task.claimUntil = 0;
+                task.data.currIndex = task.data.startIndex;
+                task.data.cursorIndex = task.data.startIndex;
+                task.data.stepsTaken = 0;
+                task.data.spikeUsed = false;
+                touchTaskVersion();
+              }
+            }
+          },
+          getRenderInfo(task, player) {
+            const sigma = task.data.noiseSigma || 0;
+            let displayGrid = task.data.lossGrid;
+            if (sigma > 0) {
+              const rng = seededRng((task.data.seed || 1) + task.sabotage.level * 1117);
+              displayGrid = task.data.lossGrid.map((v) => clamp01(v + (rng() * 2 - 1) * sigma));
+            }
+            return {
+              phase: task.phase,
+              grid: displayGrid,
+              currIndex: task.data.currIndex,
+              cursorIndex: task.data.cursorIndex,
+              goalIndex: task.data.goalIndex,
+              stepsTaken: task.data.stepsTaken,
+              requiredSteps: task.data.requiredSteps,
+              spikeUsed: !!task.data.spikeUsed,
+              isMine: task.claimedBy && task.claimedBy === player?.id,
+            };
+          },
+        },
+        packer: {
+          onEvent(task, evt, ctx) {
+            const now = ctx.now;
+            if (evt.type === 'start') {
+              if (task.phase !== 'pending' && task.phase !== 'active') return;
+              if (!task.claimedBy || task.claimedBy === ctx.actor.id || task.claimUntil < now) {
+                task.claimedBy = ctx.actor.id;
+                task.claimUntil = now + 4000;
+                task.phase = 'active';
+                touchTaskVersion();
+              }
+              return;
+            }
+            if (evt.type === 'cancel') {
+              if (task.claimedBy === ctx.actor.id && task.phase === 'active') {
+                task.phase = 'pending';
+                task.claimedBy = null;
+                task.claimUntil = 0;
+                task.data.cursorIndex = 0;
+                task.data.selectedMask = new Array(task.data.chunks.length).fill(false);
+                task.data.holdProgress = 0;
+                task.data.lastTickAt = 0;
+                touchTaskVersion();
+              }
+              return;
+            }
+            if (evt.type === 'input') {
+              if (task.phase !== 'active' || task.claimedBy !== ctx.actor.id) return;
+              if (evt.key === 'W') task.data.cursorIndex = Math.max(0, task.data.cursorIndex - 1);
+              if (evt.key === 'S') task.data.cursorIndex = Math.min(task.data.chunks.length - 1, task.data.cursorIndex + 1);
+              if (evt.key === 'TOGGLE') task.data.selectedMask[task.data.cursorIndex] = !task.data.selectedMask[task.data.cursorIndex];
+              task.claimUntil = now + 4000;
+              touchTaskVersion();
+              return;
+            }
+            if (evt.type === 'tick') {
+              if (task.phase !== 'active' || !task.claimedBy) return;
+              const player = getPlayerById(task.claimedBy);
+              if (!player || getDistanceToStation(player, task.stationId) > TASK_STATION_RANGE + 0.6 || task.claimUntil < now) {
+                task.phase = 'pending';
+                task.claimedBy = null;
+                task.claimUntil = 0;
+                task.data.holdProgress = 0;
+                task.data.lastTickAt = 0;
+                touchTaskVersion();
+                return;
+              }
+              const prev = task.data.lastTickAt || now;
+              const dtMs = Math.max(0, Math.min(250, now - prev));
+              task.data.lastTickAt = now;
+              const dtSec = dtMs / 1000;
+              const metrics = packerMetrics(task);
+              const good = metrics.usedTokens <= task.data.budgetTokens && metrics.relevanceScore >= task.data.targetRelevance;
+              task.claimUntil = now + 1800;
+              if (player.interactHeld && good) {
+                task.data.holdProgress = clamp01(task.data.holdProgress + dtSec / 1.5);
+              } else {
+                task.data.holdProgress = clamp01(task.data.holdProgress - dtSec / 2.4);
+              }
+              if (task.data.holdProgress >= 1) {
+                resolveTask(player, task, 'complete');
+                return;
+              }
+              touchTaskVersion();
+            }
+          },
+          getRenderInfo(task, player) {
+            const metrics = packerMetrics(task);
+            return {
+              phase: task.phase,
+              chunks: task.data.chunks,
+              cursorIndex: task.data.cursorIndex,
+              selectedMask: task.data.selectedMask,
+              budget: task.data.budgetTokens,
+              usedTokens: metrics.usedTokens,
+              relevanceScore: metrics.relevanceScore,
+              targetRelevance: task.data.targetRelevance,
+              holdProgress: task.data.holdProgress,
+              isMine: task.claimedBy && task.claimedBy === player?.id,
+            };
+          },
+        },
+        beam: {
+          onEvent(task, evt, ctx) {
+            const now = ctx.now;
+            if (evt.type === 'start') {
+              if (task.phase !== 'pending' && task.phase !== 'active') return;
+              if (!task.claimedBy || task.claimedBy === ctx.actor.id || task.claimUntil < now) {
+                task.claimedBy = ctx.actor.id;
+                task.claimUntil = now + 6000;
+                task.phase = 'active';
+                touchTaskVersion();
+              }
+              return;
+            }
+            if (evt.type === 'cancel') {
+              if (task.claimedBy === ctx.actor.id && task.phase === 'active') {
+                task.phase = 'pending';
+                task.claimedBy = null;
+                task.claimUntil = 0;
+                task.data.depth = 0;
+                task.data.cursorIndex = 0;
+                task.data.strikes = 0;
+                touchTaskVersion();
+              }
+              return;
+            }
+            if (evt.type === 'input') {
+              if (task.phase !== 'active' || task.claimedBy !== ctx.actor.id) return;
+              if (['W', 'A', 'S', 'D'].includes(evt.key)) {
+                task.data.cursorIndex = gridMoveIndex(task.data.cursorIndex, evt.key, 2);
+                task.claimUntil = now + 6000;
+                touchTaskVersion();
+                return;
+              }
+              if (evt.key === 'E_SELECT') {
+                const d = task.data.depth;
+                const best = task.data.bestIndexByDepth[d];
+                task.claimUntil = now + 6000;
+                if (task.data.cursorIndex === best) {
+                  task.data.depth += 1;
+                  task.data.cursorIndex = 0;
+                  if (task.data.depth >= task.data.depthMax) {
+                    resolveTask(ctx.actor, task, 'complete');
+                    return;
+                  }
+                } else {
+                  task.data.strikes += 1;
+                  if (task.data.strikes > task.data.maxStrikes) {
+                    resolveTask(ctx.actor, task, 'fail');
+                    return;
+                  }
+                }
+                touchTaskVersion();
+              }
+              return;
+            }
+            if (evt.type === 'tick' && task.phase === 'active') {
+              const player = getPlayerById(task.claimedBy);
+              if (!player || getDistanceToStation(player, task.stationId) > TASK_STATION_RANGE + 0.6 || task.claimUntil < now) {
+                task.phase = 'pending';
+                task.claimedBy = null;
+                task.claimUntil = 0;
+                task.data.depth = 0;
+                task.data.cursorIndex = 0;
+                task.data.strikes = 0;
+                touchTaskVersion();
+              }
+            }
+          },
+          getRenderInfo(task, player) {
+            const depth = task.data.depth;
+            const baseCandidates = [...(task.data.candidatesByDepth[depth] || [])];
+            const boosts = task.data.decoyBoosts?.[depth] || {};
+            for (const [idxText, amt] of Object.entries(boosts)) {
+              const idx = Number(idxText);
+              if (idx >= 0 && idx < baseCandidates.length) baseCandidates[idx] += amt;
+            }
+            return {
+              phase: task.phase,
+              depth,
+              depthMax: task.data.depthMax,
+              candidates: baseCandidates,
+              cursorIndex: task.data.cursorIndex,
+              strikes: task.data.strikes,
+              maxStrikes: task.data.maxStrikes,
+              isMine: task.claimedBy && task.claimedBy === player?.id,
+            };
+          },
+        },
+        embed: {
+          onEvent(task, evt, ctx) {
+            const now = ctx.now;
+            if (evt.type === 'start') {
+              if (task.phase !== 'pending' && task.phase !== 'active') return;
+              if (!task.claimedBy || task.claimedBy === ctx.actor.id || task.claimUntil < now) {
+                task.claimedBy = ctx.actor.id;
+                task.claimUntil = now + 6000;
+                task.phase = 'active';
+                touchTaskVersion();
+              }
+              return;
+            }
+            if (evt.type === 'cancel') {
+              if (task.claimedBy === ctx.actor.id && task.phase === 'active') {
+                task.phase = 'pending';
+                task.claimedBy = null;
+                task.claimUntil = 0;
+                task.data.round = 0;
+                task.data.cursorIndex = 0;
+                task.data.strikes = 0;
+                touchTaskVersion();
+              }
+              return;
+            }
+            if (evt.type === 'input') {
+              if (task.phase !== 'active' || task.claimedBy !== ctx.actor.id) return;
+              if (['W', 'A', 'S', 'D'].includes(evt.key)) {
+                task.data.cursorIndex = gridMoveIndex(task.data.cursorIndex, evt.key, 2);
+                task.claimUntil = now + 6000;
+                touchTaskVersion();
+                return;
+              }
+              if (evt.key === 'E_SELECT') {
+                const targetVec = task.data.targetVec || [0, 0, 0];
+                const candidates = task.data.candidates || [];
+                if (!candidates.length) {
+                  resolveTask(ctx.actor, task, 'complete');
+                  return;
+                }
+                let nearestIndex = 0;
+                let nearestDist = l2SqVec3(targetVec, candidates[0]);
+                for (let i = 1; i < candidates.length; i++) {
+                  const d = l2SqVec3(targetVec, candidates[i]);
+                  if (d < nearestDist) {
+                    nearestDist = d;
+                    nearestIndex = i;
+                  }
+                }
+                task.claimUntil = now + 6000;
+                if (task.data.cursorIndex === nearestIndex) {
+                  task.data.round += 1;
+                  task.data.cursorIndex = 0;
+                  if (task.data.round >= task.data.roundsMax) {
+                    resolveTask(ctx.actor, task, 'complete');
+                    return;
+                  }
+                  const nextRound = task.data.rounds[task.data.round];
+                  if (nextRound) {
+                    task.data.targetVec = nextRound.targetVec;
+                    task.data.candidates = nextRound.candidates;
+                  }
+                } else {
+                  task.data.strikes += 1;
+                  if (task.data.strikes > 1) {
+                    resolveTask(ctx.actor, task, 'fail');
+                    return;
+                  }
+                }
+                touchTaskVersion();
+              }
+              return;
+            }
+            if (evt.type === 'tick' && task.phase === 'active') {
+              const player = getPlayerById(task.claimedBy);
+              if (!player || getDistanceToStation(player, task.stationId) > TASK_STATION_RANGE + 0.6 || task.claimUntil < now) {
+                task.phase = 'pending';
+                task.claimedBy = null;
+                task.claimUntil = 0;
+                task.data.round = 0;
+                task.data.cursorIndex = 0;
+                task.data.strikes = 0;
+                touchTaskVersion();
+              }
+            }
+          },
+          getRenderInfo(task, player) {
+            return {
+              phase: task.phase,
+              targetVec: task.data.targetVec || [0, 0, 0],
+              candidates: task.data.candidates || [[0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]],
+              round: task.data.round,
+              roundsMax: task.data.roundsMax,
+              cursorIndex: task.data.cursorIndex,
+              strikes: task.data.strikes,
+              isMine: task.claimedBy && task.claimedBy === player?.id,
+            };
+          },
+        },
+        anneal: {
+          onEvent(task, evt, ctx) {
+            const now = ctx.now;
+            if (evt.type === 'start') {
+              if (task.phase !== 'pending' && task.phase !== 'active') return;
+              if (!task.claimedBy || task.claimedBy === ctx.actor.id || task.claimUntil < now) {
+                task.claimedBy = ctx.actor.id;
+                task.claimUntil = now + 4000;
+                task.phase = 'active';
+                task.data.lastTickAt = 0;
+                touchTaskVersion();
+              }
+              return;
+            }
+            if (evt.type === 'cancel') {
+              if (task.claimedBy === ctx.actor.id && task.phase === 'active') {
+                task.phase = 'pending';
+                task.claimedBy = null;
+                task.claimUntil = 0;
+                task.data.temp = 0.5;
+                task.data.gotExploreMs = 0;
+                task.data.gotLockInMs = 0;
+                task.data.lastTickAt = 0;
+                touchTaskVersion();
+              }
+              return;
+            }
+            if (evt.type === 'input') {
+              if (task.phase !== 'active' || task.claimedBy !== ctx.actor.id) return;
+              if (evt.key === 'R_SPIKE') {
+                task.data.temp = clamp01(task.data.temp + task.data.spikeAmount);
+                task.claimUntil = now + 4000;
+                touchTaskVersion();
+              }
+              return;
+            }
+            if (evt.type === 'tick') {
+              if (task.phase !== 'active' || !task.claimedBy) return;
+              const player = getPlayerById(task.claimedBy);
+              if (!player || getDistanceToStation(player, task.stationId) > TASK_STATION_RANGE + 0.6 || task.claimUntil < now) {
+                task.phase = 'pending';
+                task.claimedBy = null;
+                task.claimUntil = 0;
+                task.data.lastTickAt = 0;
+                touchTaskVersion();
+                return;
+              }
+              const prev = task.data.lastTickAt || now;
+              const dtMs = Math.max(0, Math.min(250, now - prev));
+              task.data.lastTickAt = now;
+              const dtSec = dtMs / 1000;
+              if (player.interactHeld) task.data.temp -= task.data.coolDownPerSec * dtSec;
+              else task.data.temp += task.data.driftUpPerSec * dtSec;
+              task.data.temp = clamp01(task.data.temp);
+              if (task.data.temp >= task.data.exploreBand[0] && task.data.temp <= task.data.exploreBand[1]) task.data.gotExploreMs += dtMs;
+              if (task.data.temp >= task.data.lockInBand[0] && task.data.temp <= task.data.lockInBand[1]) task.data.gotLockInMs += dtMs;
+              task.claimUntil = now + 1800;
+              if (task.data.gotExploreMs >= task.data.needExploreMs && task.data.gotLockInMs >= task.data.needLockInMs) {
+                resolveTask(player, task, 'complete');
+                return;
+              }
+              touchTaskVersion();
+            }
+          },
+          getRenderInfo(task, player) {
+            return {
+              phase: task.phase,
+              temp: task.data.temp,
+              exploreBand: task.data.exploreBand,
+              lockInBand: task.data.lockInBand,
+              gotExploreMs: task.data.gotExploreMs,
+              needExploreMs: task.data.needExploreMs,
+              gotLockInMs: task.data.gotLockInMs,
+              needLockInMs: task.data.needLockInMs,
+              isMine: task.claimedBy && task.claimedBy === player?.id,
+            };
+          },
+        },
+      };
+
+      function createStationUiSprite() {
+        const canvas = document.createElement('canvas');
+        canvas.width = 512;
+        canvas.height = 128;
+        const ctx = canvas.getContext('2d');
+        const texture = new THREE.CanvasTexture(canvas);
+        texture.colorSpace = THREE.SRGBColorSpace;
+        const material = new THREE.SpriteMaterial({
+          map: texture,
+          transparent: true,
+          depthWrite: false,
+          opacity: 0,
+        });
+        const sprite = new THREE.Sprite(material);
+        sprite.scale.set(4.2, 1.05, 1);
+        return { canvas, ctx, texture, sprite };
+      }
+
+      function drawStationUi(stationId, task, nowMs) {
+        const visual = stationVisuals.get(stationId);
+        if (!visual) return;
+        const uiSprite = visual.ui;
+        const { ctx, canvas, texture, sprite } = uiSprite;
+        const clearHide = () => {
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+          texture.needsUpdate = true;
+          sprite.material.opacity = 0;
+        };
+
+        if (!task) {
+          clearHide();
+          return;
+        }
+
+        const renderInfo = TASK_TYPES[task.type].getRenderInfo(task, nowMs, localPlayer);
+        const showFlash = task.flashUntil && nowMs < task.flashUntil;
+        const showPending = task.phase === 'pending';
+        const showActive = task.phase === 'active';
+        if (!showPending && !showActive && !showFlash) {
+          clearHide();
+          return;
+        }
+
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = 'rgba(7, 12, 18, 0.86)';
+        ctx.strokeStyle = task.phase === 'failed' ? palette.traitor : palette.honest;
+        ctx.lineWidth = 4;
+        ctx.beginPath();
+        ctx.roundRect(8, 10, canvas.width - 16, canvas.height - 20, 16);
+        ctx.fill();
+        ctx.stroke();
+
+        ctx.font = '700 30px "JetBrains Mono"';
+        ctx.textBaseline = 'middle';
+        ctx.textAlign = 'left';
+        ctx.fillStyle = palette.text;
+
+        if (showFlash) {
+          const failed = task.phase === 'failed';
+          ctx.fillStyle = failed ? palette.traitor : palette.node;
+          ctx.font = '800 42px "JetBrains Mono"';
+          ctx.fillText(failed ? 'FAILED' : 'DONE', 26, 64);
+          sprite.material.opacity = 0.95;
+          texture.needsUpdate = true;
+          return;
+        }
+
+        if (showPending) {
+          ctx.fillStyle = palette.warn;
+          ctx.fillText(taskTypeLabel(task.type), 22, 48);
+          ctx.fillStyle = palette.honest;
+          ctx.font = '700 22px "JetBrains Mono"';
+          ctx.fillText('PRESS E', 22, 86);
+          sprite.material.opacity = 0.9;
+          texture.needsUpdate = true;
+          return;
+        }
+
+        if (task.type === 'hold') {
+          ctx.fillStyle = palette.honest;
+          ctx.fillText('HOLD', 20, 38);
+          const p = renderInfo.progress || 0;
+          ctx.strokeStyle = 'rgba(255,255,255,0.2)';
+          ctx.strokeRect(20, 66, 472, 34);
+          ctx.fillStyle = palette.node;
+          ctx.fillRect(22, 68, Math.floor(468 * p), 30);
+          ctx.fillStyle = palette.text;
+          ctx.font = '700 18px "JetBrains Mono"';
+          ctx.fillText(`HOLD E ${(p * 100).toFixed(0)}%`, 26, 112);
+        } else if (task.type === 'sequence') {
+          ctx.fillStyle = palette.warn;
+          ctx.fillText('SEQ', 20, 36);
+          const seq = renderInfo.seq || [];
+          ctx.font = '700 26px "JetBrains Mono"';
+          for (let i = 0; i < seq.length; i++) {
+            const x = 98 + i * 44;
+            const active = i === renderInfo.index;
+            ctx.fillStyle = active ? palette.node : palette.text;
+            ctx.fillText(seq[i], x, 38);
+          }
+          ctx.font = '700 18px "JetBrains Mono"';
+          ctx.fillStyle = palette.traitor;
+          ctx.fillText(`STRIKES ${renderInfo.strikes}/${renderInfo.maxStrikes}`, 20, 88);
+          ctx.fillStyle = palette.honest;
+          ctx.fillText('INPUT WASD', 20, 112);
+        } else if (task.type === 'gradient') {
+          ctx.fillStyle = palette.node;
+          ctx.fillText('GRADIENT', 20, 32);
+          const gx = 20;
+          const gy = 44;
+          const cell = 24;
+          const grid = renderInfo.grid || [];
+          ctx.font = '700 12px "JetBrains Mono"';
+          for (let i = 0; i < 9; i++) {
+            const x = gx + (i % 3) * (cell + 4);
+            const y = gy + Math.floor(i / 3) * (cell + 4);
+            const isCurr = i === renderInfo.currIndex;
+            const isCursor = i === renderInfo.cursorIndex;
+            const isGoal = i === renderInfo.goalIndex;
+            ctx.strokeStyle = isGoal ? palette.warn : 'rgba(255,255,255,0.35)';
+            ctx.lineWidth = isCursor ? 3 : 1.5;
+            ctx.strokeRect(x, y, cell, cell);
+            if (isCurr) {
+              ctx.fillStyle = 'rgba(99,255,218,0.18)';
+              ctx.fillRect(x + 1, y + 1, cell - 2, cell - 2);
+            }
+            ctx.fillStyle = palette.text;
+            ctx.fillText((grid[i] || 0).toFixed(2), x + 2, y + 14);
+          }
+          ctx.font = '700 16px "JetBrains Mono"';
+          ctx.fillStyle = palette.honest;
+          ctx.fillText(`STEPS ${renderInfo.stepsTaken}/${renderInfo.requiredSteps}`, 132, 58);
+          ctx.fillStyle = palette.warn;
+          ctx.fillText(`SPIKE ${renderInfo.spikeUsed ? 'USED' : 'READY'}`, 132, 80);
+          ctx.fillStyle = palette.text;
+          ctx.font = '700 14px "JetBrains Mono"';
+          ctx.fillText('WASD MOVE · E STEP', 132, 106);
+        } else if (task.type === 'packer') {
+          ctx.fillStyle = palette.node;
+          ctx.fillText('PACKER', 20, 32);
+          const chunks = renderInfo.chunks || [];
+          ctx.font = '700 14px "JetBrains Mono"';
+          for (let i = 0; i < Math.min(4, chunks.length); i++) {
+            const c = chunks[i];
+            const y = 52 + i * 18;
+            const marker = renderInfo.selectedMask?.[i] ? '[x]' : '[ ]';
+            ctx.fillStyle = i === renderInfo.cursorIndex ? palette.warn : palette.text;
+            ctx.fillText(`${marker} C${i + 1} ${c.size}t ${(c.relevance * 100).toFixed(0)}%${c.isPoison ? ' !' : ''}`, 20, y);
+          }
+          const usedRatio = clamp01((renderInfo.usedTokens || 0) / Math.max(1, renderInfo.budget || 1));
+          ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+          ctx.strokeRect(268, 36, 220, 16);
+          ctx.fillStyle = usedRatio <= 1 ? palette.honest : palette.traitor;
+          ctx.fillRect(269, 37, Math.floor(218 * Math.min(1, usedRatio)), 14);
+          ctx.font = '700 13px "JetBrains Mono"';
+          ctx.fillStyle = palette.text;
+          ctx.fillText(`TOK ${renderInfo.usedTokens}/${renderInfo.budget}`, 268, 63);
+          ctx.fillText(`REL ${(renderInfo.relevanceScore * 100).toFixed(0)}% / ${(renderInfo.targetRelevance * 100).toFixed(0)}%`, 268, 80);
+          ctx.fillStyle = palette.node;
+          ctx.fillRect(268, 92, Math.floor(220 * (renderInfo.holdProgress || 0)), 14);
+          ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+          ctx.strokeRect(268, 92, 220, 14);
+        } else if (task.type === 'beam') {
+          ctx.fillStyle = palette.node;
+          ctx.fillText('BEAM', 20, 32);
+          const cands = renderInfo.candidates || [0, 0, 0, 0];
+          ctx.font = '700 14px "JetBrains Mono"';
+          for (let i = 0; i < 4; i++) {
+            const col = i % 2;
+            const row = Math.floor(i / 2);
+            const x = 20 + col * 110;
+            const y = 48 + row * 34;
+            ctx.strokeStyle = i === renderInfo.cursorIndex ? palette.warn : 'rgba(255,255,255,0.25)';
+            ctx.strokeRect(x, y, 100, 28);
+            ctx.fillStyle = palette.text;
+            ctx.fillText(`B${i + 1} ${(cands[i] || 0).toFixed(2)}`, x + 6, y + 17);
+          }
+          ctx.fillStyle = palette.honest;
+          ctx.fillText(`DEPTH ${renderInfo.depth}/${renderInfo.depthMax}`, 262, 52);
+          ctx.fillStyle = palette.traitor;
+          ctx.fillText(`STRIKES ${renderInfo.strikes}/${renderInfo.maxStrikes}`, 262, 76);
+          ctx.fillStyle = palette.text;
+          ctx.fillText('WASD MOVE · E SELECT', 262, 102);
+        } else if (task.type === 'embed') {
+          const tv = renderInfo.targetVec || [0, 0, 0];
+          ctx.fillStyle = palette.node;
+          ctx.fillText('EMBED', 20, 32);
+          ctx.font = '700 13px "JetBrains Mono"';
+          const channels = ['R', 'G', 'B'];
+          const colors = ['#ff6060', '#78ff78', '#66a6ff'];
+          for (let i = 0; i < 3; i++) {
+            ctx.fillStyle = colors[i];
+            ctx.fillRect(20, 44 + i * 14, Math.floor((tv[i] / 255) * 120), 10);
+            ctx.fillStyle = palette.text;
+            ctx.fillText(`${channels[i]} ${tv[i]}`, 146, 51 + i * 14);
+          }
+          const cands = renderInfo.candidates || [[0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]];
+          for (let i = 0; i < 4; i++) {
+            const x = 220 + (i % 2) * 136;
+            const y = 38 + Math.floor(i / 2) * 36;
+            const v = cands[i];
+            ctx.strokeStyle = i === renderInfo.cursorIndex ? palette.warn : 'rgba(255,255,255,0.3)';
+            ctx.strokeRect(x, y, 126, 30);
+            ctx.fillStyle = palette.text;
+            ctx.fillText(`${v[0]},${v[1]},${v[2]}`, x + 6, y + 18);
+          }
+          ctx.fillStyle = palette.honest;
+          ctx.fillText(`ROUND ${renderInfo.round + 1}/${renderInfo.roundsMax}`, 20, 108);
+          ctx.fillStyle = palette.traitor;
+          ctx.fillText(`STRIKES ${renderInfo.strikes}/1`, 170, 108);
+        } else if (task.type === 'anneal') {
+          ctx.fillStyle = palette.node;
+          ctx.fillText('ANNEAL', 20, 32);
+          const temp = clamp01(renderInfo.temp || 0);
+          const barX = 20;
+          const barY = 56;
+          const barW = 472;
+          const barH = 16;
+          ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+          ctx.strokeRect(barX, barY, barW, barH);
+          ctx.fillStyle = 'rgba(255,255,255,0.08)';
+          ctx.fillRect(barX + 1, barY + 1, barW - 2, barH - 2);
+          const exA = barX + Math.floor(barW * renderInfo.exploreBand[0]);
+          const exB = barX + Math.floor(barW * renderInfo.exploreBand[1]);
+          const lkA = barX + Math.floor(barW * renderInfo.lockInBand[0]);
+          const lkB = barX + Math.floor(barW * renderInfo.lockInBand[1]);
+          ctx.fillStyle = 'rgba(255,184,107,0.28)';
+          ctx.fillRect(exA, barY + 1, Math.max(1, exB - exA), barH - 2);
+          ctx.fillStyle = 'rgba(99,255,218,0.26)';
+          ctx.fillRect(lkA, barY + 1, Math.max(1, lkB - lkA), barH - 2);
+          ctx.fillStyle = palette.node;
+          ctx.fillRect(barX, barY + 3, Math.floor(barW * temp), barH - 6);
+          ctx.fillStyle = palette.text;
+          ctx.font = '700 15px "JetBrains Mono"';
+          ctx.fillText(`TEMP ${(temp * 100).toFixed(0)}%`, 20, 88);
+          ctx.fillText(`EXP ${(renderInfo.gotExploreMs / 1000).toFixed(1)}/${(renderInfo.needExploreMs / 1000).toFixed(1)}s`, 170, 88);
+          ctx.fillText(`LOCK ${(renderInfo.gotLockInMs / 1000).toFixed(1)}/${(renderInfo.needLockInMs / 1000).toFixed(1)}s`, 340, 88);
+          ctx.fillStyle = palette.warn;
+          ctx.fillText('HOLD E COOL · R SPIKE', 20, 112);
+        }
+
+        sprite.material.opacity = 0.92;
+        texture.needsUpdate = true;
+      }
+
+      function createStationVisual(stationId, scale = 1) {
+        const group = new THREE.Group();
+        const core = new THREE.Mesh(
+          new THREE.CylinderGeometry(0.5 * scale, 0.6 * scale, 0.2 * scale, 6),
+          new THREE.MeshStandardMaterial({
+            color: new THREE.Color(palette.node),
+            emissive: new THREE.Color(palette.honest),
+            emissiveIntensity: 0.5,
+            roughness: 0.35,
+            metalness: 0.4,
+          }),
+        );
+        const shell = new THREE.Mesh(
+          new THREE.CylinderGeometry(0.5 * scale, 0.6 * scale, 0.2 * scale, 6),
+          new THREE.MeshBasicMaterial({
+            color: new THREE.Color(palette.honest),
+            wireframe: true,
+            transparent: true,
+            opacity: 0.45,
+          }),
+        );
+        shell.scale.setScalar(1.05);
+        const glow = new THREE.Mesh(
+          new THREE.CylinderGeometry(0.75 * scale, 0.85 * scale, 0.25 * scale, 6),
+          new THREE.MeshBasicMaterial({
+            color: new THREE.Color(palette.honest),
+            transparent: true,
+            opacity: 0.08,
+            blending: THREE.AdditiveBlending,
+            side: THREE.BackSide,
+            depthWrite: false,
+          }),
+        );
+        const ring = new THREE.Mesh(
+          new THREE.RingGeometry(0.7 * scale, 0.85 * scale, 6),
+          new THREE.MeshBasicMaterial({
+            color: new THREE.Color(palette.honest),
+            transparent: true,
+            opacity: 0.18,
+            blending: THREE.AdditiveBlending,
+            side: THREE.DoubleSide,
+            depthWrite: false,
+          }),
+        );
+        ring.rotation.x = -Math.PI / 2;
+        ring.position.y = -0.085 * scale;
+
+        const uiObj = createStationUiSprite();
+        uiObj.sprite.position.y = 0.6 * scale;
+
+        group.add(core, shell, glow, ring, uiObj.sprite);
+        const pos = getStationPosition(stationId);
+        if (pos) group.position.copy(pos);
+        scene.add(group);
+
+        stationVisuals.set(stationId, {
+          stationId,
+          group,
+          core,
+          shell,
+          glow,
+          ring,
+          ui: uiObj,
+          scale,
+          glitchAt: 0,
+        });
+      }
+
+      function disposeStationVisual(stationId) {
+        const visual = stationVisuals.get(stationId);
+        if (!visual) return;
+        scene.remove(visual.group);
+        visual.group.traverse((obj) => {
+          obj.geometry?.dispose?.();
+          obj.material?.dispose?.();
+        });
+        stationVisuals.delete(stationId);
+      }
+
+      function ensureStationVisuals(expectedStationIds) {
+        for (const stationId of expectedStationIds) {
+          if (!stationVisuals.has(stationId)) {
+            createStationVisual(stationId, stationId === 'central' ? 1 : stationId.startsWith('field:') ? 0.75 : 0.6);
+          }
+          const pos = getStationPosition(stationId);
+          if (pos) stationVisuals.get(stationId).group.position.copy(pos);
+        }
+        for (const stationId of [...stationVisuals.keys()]) {
+          if (!expectedStationIds.has(stationId)) {
+            disposeStationVisual(stationId);
+          }
+        }
+      }
+
+      function rebuildTaskStationsFromTopology() {
+        const ids = getKnownPlayerIds();
+        const expected = new Set(['central']);
+
+        for (let i = 0; i < MIN_FIELD_STATIONS; i++) expected.add(`field:${i}`);
+
+        const branchStationsNeeded = Math.max(0, ids.length - 1);
+        const extraFieldStations = Math.max(0, Math.ceil(ids.length / 2) - MIN_FIELD_STATIONS);
+        for (let i = MIN_FIELD_STATIONS; i < MIN_FIELD_STATIONS + extraFieldStations; i++) expected.add(`field:${i}`);
+
+        for (let i = 1; i <= branchStationsNeeded; i++) expected.add(stationIdForBranchIndex(i));
+
+        ensureStationVisuals(expected);
+
+        for (const stationId of expected) {
+          if (!(stationId in sessionState.stationsTask)) {
+            sessionState.stationsTask[stationId] = null;
+            if (isAuthority()) touchTaskVersion();
+          }
+        }
+
+        for (const stationId of Object.keys(sessionState.stationsTask)) {
+          if (!expected.has(stationId)) {
+            if (isAuthority()) {
+              const taskId = sessionState.stationsTask[stationId];
+              if (taskId && sessionState.tasksById[taskId]) {
+                delete sessionState.tasksById[taskId];
+                touchTaskVersion();
+              }
+            }
+            delete sessionState.stationsTask[stationId];
+            if (isAuthority()) touchTaskVersion();
+          }
+        }
+      }
+
+      function getNearestStation(player = localPlayer) {
+        let best = null;
+        let bestDist = Number.POSITIVE_INFINITY;
+        for (const stationId of Object.keys(sessionState.stationsTask)) {
+          const pos = getStationPosition(stationId);
+          if (!pos) continue;
+          const dist = player.mesh.position.distanceTo(pos);
+          if (dist < bestDist) {
+            bestDist = dist;
+            best = stationId;
+          }
+        }
+        return best ? { stationId: best, distance: bestDist, task: getTaskByStation(best) } : null;
+      }
+
+      function getLocalClaimedTask() {
+        for (const taskId of Object.values(sessionState.stationsTask)) {
+          if (!taskId) continue;
+          const task = sessionState.tasksById[taskId];
+          if (!task) continue;
+          if (task.phase === 'active' && task.claimedBy === localPlayer.id) return task;
+        }
+        return null;
+      }
+
+      function updateStationVisuals(elapsed) {
+        const nowMs = Date.now();
+        for (const [stationId, visual] of stationVisuals.entries()) {
+          const task = getTaskByStation(stationId);
+          const phase = getStationState(stationId);
+          const sabotaged = !!task && task.sabotage.level > 0;
+          const idlePulse = Math.sin(elapsed * 1.5 + visual.scale * 0.3);
+          const urgentPulse = Math.sin(elapsed * 5 + visual.scale * 0.7);
+
+          let emissiveIntensity = 0.45 + idlePulse * 0.2;
+          let glowOpacity = 0.07 + idlePulse * 0.04;
+          let ringOpacity = 0.16;
+
+          if (phase === 'pending') {
+            emissiveIntensity = 1 + urgentPulse * 0.5;
+            glowOpacity = 0.18 + Math.max(0, urgentPulse) * 0.15;
+            ringOpacity = 0.15 + (urgentPulse > 0.2 ? 0.38 : 0.04);
+          } else if (phase === 'active') {
+            emissiveIntensity = 1.18;
+            glowOpacity = 0.2;
+            ringOpacity = 0.3;
+          } else if (phase === 'completed') {
+            emissiveIntensity = 1.35;
+            glowOpacity = 0.25;
+            ringOpacity = 0.34;
+          } else if (phase === 'failed') {
+            emissiveIntensity = 0.85;
+            glowOpacity = 0.12;
+            ringOpacity = 0.12;
+          }
+
+          const now = performance.now();
+          if (sabotaged && now > visual.glitchAt) {
+            visual.glitchAt = now + 3000 + Math.random() * 2000;
+          }
+          const glitchOn = sabotaged && now > visual.glitchAt - 110 && now < visual.glitchAt;
+
+          visual.core.material.emissive.set(glitchOn ? new THREE.Color(palette.danger) : new THREE.Color(palette.honest));
+          visual.shell.material.color.set(glitchOn ? new THREE.Color(palette.traitor) : new THREE.Color(palette.honest));
+          visual.glow.material.color.set(glitchOn ? new THREE.Color(palette.danger) : new THREE.Color(palette.honest));
+          visual.ring.material.color.set(glitchOn ? new THREE.Color(palette.traitor) : new THREE.Color(palette.honest));
+
+          visual.core.material.emissiveIntensity = emissiveIntensity;
+          visual.glow.material.opacity = glowOpacity;
+          visual.ring.material.opacity = ringOpacity;
+          visual.group.rotation.y += 0.0025 * visual.scale;
+
+          drawStationUi(stationId, task, nowMs);
+        }
+      }
+
+      function serializeTasksState() {
+        const tasksById = {};
+        for (const [id, task] of Object.entries(sessionState.tasksById)) {
+          tasksById[id] = cloneTask(task);
+        }
+        return {
+          tasksById,
+          stationsTask: { ...sessionState.stationsTask },
+          taskVersion: sessionState.taskVersion,
+        };
+      }
+
+      function applyTasksState(session) {
+        if (!session || typeof session !== 'object') return;
+        if (!session.tasksById || !session.stationsTask) return;
+        sessionState.tasksById = {};
+        for (const [id, task] of Object.entries(session.tasksById)) {
+          sessionState.tasksById[id] = cloneTask(task);
+        }
+        sessionState.stationsTask = { ...session.stationsTask };
+        sessionState.taskVersion = typeof session.taskVersion === 'number' ? session.taskVersion : sessionState.taskVersion;
+
+        let maxSeq = 0;
+        for (const id of Object.keys(sessionState.tasksById)) {
+          const n = Number((id || '').replace('t', ''));
+          if (Number.isFinite(n)) maxSeq = Math.max(maxSeq, n);
+        }
+        sessionState.taskSeq = Math.max(sessionState.taskSeq, maxSeq + 1);
+      }
+
       // -------------------------------------------------------------------------
       // Player factory
       // -------------------------------------------------------------------------
@@ -1348,6 +2852,8 @@
           if (player) assignPlayerRole(player, index, ids.length);
         });
 
+        rebuildTaskStationsFromTopology();
+
         updateConnectionUI();
         updateAgentUI();
       }
@@ -1420,7 +2926,7 @@
         ui.secretObjectiveLabel.textContent = sessionState.hiddenGoal;
         ui.secretPanel.classList.toggle('visible', isTraitor);
         glitchMaterial.uniforms.uIntensity.value =
-          (isTraitor ? 0.78 : 0) + (performance.now() < sessionState.temperatureSpikeUntil ? 0.45 : 0);
+          (isTraitor ? 0.35 : 0) + (performance.now() < sessionState.temperatureSpikeUntil ? 0.25 : 0);
       }
 
       function updateConnectionUI() {
@@ -1531,6 +3037,7 @@
           type: 'snapshot',
           id: localPlayer.id,
           state: localPlayer.state,
+          interactHeld: !!localPlayer.interactHeld,
           poisoned: promptPoisoned,
           position: localPlayer.mesh.position.toArray(),
           rotationY: localPlayer.mesh.rotation.y,
@@ -1544,6 +3051,7 @@
             outputText: sessionState.outputText,
             nodeUtterance: sessionState.nodeUtterance,
             temperatureSpikeRemaining: Math.max(0, sessionState.temperatureSpikeUntil - performance.now()),
+            ...serializeTasksState(),
           },
         });
       }
@@ -1571,6 +3079,7 @@
           stemLine: null,
           linkLine: null,
           activePulse: 0,
+          interactHeld: false,
         };
 
         remotePlayers.set(id, remote);
@@ -1618,6 +3127,8 @@
             }
           }
 
+          remote.interactHeld = !!msg.interactHeld;
+
           if (msg.session) applySessionState(msg.session);
 
           if (msg.poisoned === true && !promptPoisoned) {
@@ -1653,6 +3164,7 @@
           type: 'state',
           id: localPlayer.id,
           state: localPlayer.state,
+          interactHeld: !!localPlayer.interactHeld,
           poisoned: promptPoisoned,
           position: localPlayer.mesh.position.toArray(),
           rotationY: localPlayer.mesh.rotation.y,
@@ -1671,7 +3183,11 @@
         if (typeof nextSession.temperatureSpikeRemaining === 'number') {
           sessionState.temperatureSpikeUntil = performance.now() + Math.max(0, nextSession.temperatureSpikeRemaining);
         }
+        if (typeof nextSession.taskVersion === 'number' && nextSession.taskVersion !== sessionState.taskVersion) {
+          applyTasksState(nextSession);
+        }
         setPromptUtterance(sessionState.nodeUtterance);
+        rebuildTaskStationsFromTopology();
         updateAgentUI();
       }
 
@@ -1679,19 +3195,25 @@
         const now = performance.now();
         if (!force && now - lastSessionBroadcast < 150) return;
         lastSessionBroadcast = now;
+        const sessionPayload = {
+          rootId: sessionState.rootId,
+          promptText: sessionState.promptText,
+          hiddenGoal: sessionState.hiddenGoal,
+          contextBudget: sessionState.contextBudget,
+          corruption: sessionState.corruption,
+          completion: sessionState.completion,
+          outputText: sessionState.outputText,
+          nodeUtterance: sessionState.nodeUtterance,
+          temperatureSpikeRemaining: Math.max(0, sessionState.temperatureSpikeUntil - performance.now()),
+          taskVersion: sessionState.taskVersion,
+        };
+        if (force || lastTaskVersionSent !== sessionState.taskVersion) {
+          Object.assign(sessionPayload, serializeTasksState());
+          lastTaskVersionSent = sessionState.taskVersion;
+        }
         broadcast({
           type: 'session-sync',
-          session: {
-            rootId: sessionState.rootId,
-            promptText: sessionState.promptText,
-            hiddenGoal: sessionState.hiddenGoal,
-            contextBudget: sessionState.contextBudget,
-            corruption: sessionState.corruption,
-            completion: sessionState.completion,
-            outputText: sessionState.outputText,
-            nodeUtterance: sessionState.nodeUtterance,
-            temperatureSpikeRemaining: Math.max(0, sessionState.temperatureSpikeUntil - performance.now()),
-          },
+          session: sessionPayload,
         });
       }
 
@@ -1753,6 +3275,50 @@
       function updateAuthoritySimulation(delta, elapsed) {
         if (!isAuthority()) return;
 
+        const nowMs = Date.now();
+
+        for (const stationId of Object.keys(sessionState.stationsTask)) {
+          const taskId = sessionState.stationsTask[stationId];
+          if (!taskId) continue;
+          const task = sessionState.tasksById[taskId];
+          if (!task) {
+            sessionState.stationsTask[stationId] = null;
+            touchTaskVersion();
+            continue;
+          }
+
+          const handler = TASK_TYPES[task.type];
+          if (handler) handler.onEvent(task, { type: 'tick' }, { now: nowMs, elapsed });
+
+          if (task.phase === 'completed' || task.phase === 'failed') {
+            if (!task.flashUntil) task.flashUntil = nowMs + 1000;
+            if (nowMs > task.flashUntil) {
+              delete sessionState.tasksById[task.id];
+              sessionState.stationsTask[stationId] = null;
+              touchTaskVersion();
+            }
+            continue;
+          }
+
+          if (nowMs > task.expiresAt) {
+            resolveTask(getPlayerById(task.claimedBy), task, 'fail');
+          }
+        }
+
+        if (elapsed > nextTaskGenerationAt) {
+          lastTaskGenerationAt = elapsed;
+          nextTaskGenerationAt = elapsed + 3 + Math.random() * 2;
+          const stationIds = Object.keys(sessionState.stationsTask);
+          const emptyStations = stationIds.filter((sid) => !sessionState.stationsTask[sid]);
+          if (emptyStations.length) {
+            const pick = emptyStations[Math.floor(Math.random() * emptyStations.length)];
+            const task = buildTask(pick, getAllPlayers().length);
+            sessionState.tasksById[task.id] = task;
+            sessionState.stationsTask[pick] = task.id;
+            touchTaskVersion();
+          }
+        }
+
         const players = getAllPlayers();
         const activePlayers = players.length;
         let stabilizers = 0;
@@ -1798,6 +3364,92 @@
       function handleAuthorityAction(senderId, action) {
         const actor = senderId === localPlayer.id ? localPlayer : remotePlayers.get(senderId);
         if (!actor) return;
+
+        if (action && typeof action === 'object' && action.type) {
+          const nowMs = Date.now();
+          const stationId = action.stationId;
+          const task = getTaskByStation(stationId);
+          const isNotCentralStation = stationId && stationId !== 'central';
+
+          if (action.type === 'task_start' && task) {
+            if (getDistanceToStation(actor, stationId) <= TASK_STATION_RANGE) {
+              const handler = TASK_TYPES[task.type];
+              if (handler) handler.onEvent(task, { type: 'start' }, { actor, now: nowMs, interactHeld: !!actor.interactHeld });
+            }
+          }
+
+          if (action.type === 'task_cancel' && task) {
+            const handler = TASK_TYPES[task.type];
+            if (handler) handler.onEvent(task, { type: 'cancel' }, { actor, now: nowMs, interactHeld: !!actor.interactHeld });
+          }
+
+          if (action.type === 'task_input' && task) {
+            const handler = TASK_TYPES[task.type];
+            if (handler) {
+              handler.onEvent(task, { type: 'input', key: action.key }, { actor, now: nowMs, interactHeld: !!actor.interactHeld });
+            }
+          }
+
+          if (action.type === 'task_spike' && task && task.type === 'anneal') {
+            TASK_TYPES.anneal.onEvent(task, { type: 'input', key: 'R_SPIKE' }, { actor, now: nowMs, interactHeld: !!actor.interactHeld });
+          }
+
+          if (action.type === 'task_sabotage' && task && isNotCentralStation && actor.state === 'hallucinator') {
+            if (getDistanceToStation(actor, stationId) <= TASK_STATION_RANGE) {
+              task.sabotage.level = Math.min(3, (task.sabotage.level || 0) + 1);
+              task.sabotage.lastBy = actor.id;
+              if (task.type === 'hold') {
+                task.data.durationMs = Math.floor(task.data.durationMs * 1.2);
+              } else if (task.type === 'sequence') {
+                task.data.len = Math.min(7, task.data.len + 1);
+              } else if (task.type === 'gradient') {
+                task.data.noiseSigma = Math.min(0.22, (task.data.noiseSigma || 0) + 0.05);
+              } else if (task.type === 'packer') {
+                task.data.budgetTokens = Math.max(24, Math.floor(task.data.budgetTokens * 0.9));
+                const idx = task.data.chunks.length ? Math.floor(Math.random() * task.data.chunks.length) : -1;
+                if (idx >= 0 && Math.random() < 0.5) task.data.chunks[idx].isPoison = true;
+              } else if (task.type === 'beam') {
+                const d = task.data.depth || 0;
+                const decoy = Math.floor(Math.random() * 4);
+                if (!task.data.decoyBoosts[d]) task.data.decoyBoosts[d] = {};
+                task.data.decoyBoosts[d][decoy] = Math.max(task.data.decoyBoosts[d][decoy] || 0, 0.25 + Math.random() * 0.25);
+              } else if (task.type === 'embed') {
+                if (Array.isArray(task.data.candidates) && task.data.candidates.length >= 2) {
+                  const rng = seededRng((task.data.seed || 1) + task.sabotage.level * 977 + nowMs);
+                  shuffleInPlace(task.data.candidates, rng);
+                }
+              } else if (task.type === 'anneal') {
+                const narrow = 0.05;
+                task.data.exploreBand[0] = clamp01(task.data.exploreBand[0] + narrow);
+                task.data.exploreBand[1] = clamp01(task.data.exploreBand[1] - narrow);
+                if (task.data.exploreBand[0] > task.data.exploreBand[1]) {
+                  const mid = (task.data.exploreBand[0] + task.data.exploreBand[1]) * 0.5;
+                  task.data.exploreBand[0] = clamp01(mid - 0.01);
+                  task.data.exploreBand[1] = clamp01(mid + 0.01);
+                }
+                task.data.lockInBand[0] = clamp01(task.data.lockInBand[0] + narrow);
+                task.data.lockInBand[1] = clamp01(task.data.lockInBand[1] - narrow);
+                if (task.data.lockInBand[0] > task.data.lockInBand[1]) {
+                  const mid = (task.data.lockInBand[0] + task.data.lockInBand[1]) * 0.5;
+                  task.data.lockInBand[0] = clamp01(mid - 0.01);
+                  task.data.lockInBand[1] = clamp01(mid + 0.01);
+                }
+              }
+              sessionState.corruption = clampPercent(sessionState.corruption + 2);
+              touchTaskVersion();
+              pulsePlayerBranch(actor, 1);
+            }
+          }
+
+          if (action.type === 'task_audit' && task && isNotCentralStation && actor.state === 'honest') {
+            if (getDistanceToStation(actor, stationId) <= TASK_STATION_RANGE && task.phase !== 'active' && task.sabotage.level > 0) {
+              task.sabotage.level = Math.max(0, task.sabotage.level - 1);
+              sessionState.contextBudget = clampPercent(sessionState.contextBudget + 1.5);
+              touchTaskVersion();
+              pulsePlayerBranch(actor, 0.7);
+            }
+          }
+        }
 
         if (action === 'poison' && actor.state === 'hallucinator' && getDistanceToPrompt(actor) <= 3.25) {
           setPromptPoisoned(true, true);
@@ -1850,6 +3502,33 @@
         if (now - localPlayer.lastActionAt < 500) return;
         localPlayer.lastActionAt = now;
 
+        const nearest = getNearestStation(localPlayer);
+        if (nearest && nearest.distance <= TASK_STATION_RANGE) {
+          const task = nearest.task;
+          if (task) {
+            const isNotCentral = nearest.stationId !== 'central';
+            const isMine = task.claimedBy === localPlayer.id;
+            if (task.phase === 'active' && isMine && task.type === 'hold') {
+              requestAuthorityAction({ type: 'task_cancel', stationId: nearest.stationId });
+              log(`Task cancelled at ${nearest.stationId}.`);
+              return;
+            }
+            if (localPlayer.state === 'hallucinator' && isNotCentral) {
+              requestAuthorityAction({ type: 'task_sabotage', stationId: nearest.stationId });
+              log(`Sabotage injected at ${nearest.stationId}.`);
+              return;
+            }
+            if (localPlayer.state === 'honest' && isNotCentral && task.sabotage.level > 0 && task.phase !== 'active') {
+              requestAuthorityAction({ type: 'task_audit', stationId: nearest.stationId });
+              log(`Audit run at ${nearest.stationId}. Sabotage reduced.`);
+              return;
+            }
+            requestAuthorityAction({ type: 'task_start', stationId: nearest.stationId });
+            log(`Task interaction started at ${nearest.stationId}.`);
+            return;
+          }
+        }
+
         const promptDistance = getDistanceToPrompt(localPlayer);
         const anchorDistance = getDistanceToAnchor(localPlayer);
 
@@ -1899,7 +3578,48 @@
           e.preventDefault();
         }
 
+        const localTask = getLocalClaimedTask();
+        const interactiveTypes = ['sequence', 'gradient', 'packer', 'beam', 'embed'];
+        const captureInput = !!localTask && interactiveTypes.includes(localTask.type) && localTask.phase === 'active';
+        const annealActive = !!localTask && localTask.type === 'anneal' && localTask.phase === 'active';
+        if (captureInput && ['KeyW', 'KeyA', 'KeyS', 'KeyD'].includes(e.code) && !e.repeat) {
+          const key = e.code.slice(-1);
+          requestAuthorityAction({ type: 'task_input', stationId: localTask.stationId, key });
+          return;
+        }
+
+        if (captureInput && localTask.type === 'packer' && e.code === 'KeyQ' && !e.repeat) {
+          requestAuthorityAction({ type: 'task_input', stationId: localTask.stationId, key: 'TOGGLE' });
+          return;
+        }
+
+        if (captureInput && localTask.type === 'gradient' && e.code === 'KeyE' && !e.repeat) {
+          requestAuthorityAction({ type: 'task_input', stationId: localTask.stationId, key: 'E_STEP' });
+          return;
+        }
+
+        if (captureInput && ['beam', 'embed'].includes(localTask.type) && e.code === 'KeyE' && !e.repeat) {
+          requestAuthorityAction({ type: 'task_input', stationId: localTask.stationId, key: 'E_SELECT' });
+          return;
+        }
+
+        if (annealActive && e.code === 'KeyR' && !e.repeat) {
+          requestAuthorityAction({ type: 'task_spike', stationId: localTask.stationId });
+          return;
+        }
+
         keys[e.code] = true;
+
+        if (e.code === 'KeyE') {
+          localPlayer.interactHeld = true;
+          broadcastLocalState(true);
+          if (localTask && localTask.phase === 'active') {
+            if (localTask.type === 'hold' && !e.repeat) {
+              performContextAction();
+            }
+            return;
+          }
+        }
 
         if (e.code === 'KeyQ' && !e.repeat) toggleAgentState();
         if (e.code === 'KeyE' && !e.repeat) performContextAction();
@@ -1909,6 +3629,12 @@
 
       window.addEventListener('keyup', (e) => {
         keys[e.code] = false;
+        if (e.code === 'KeyE') {
+          localPlayer.interactHeld = false;
+          broadcastLocalState(true);
+          // Hold tasks pause on E release (handled by authority tick via interactHeld).
+          // Other task types remain active until resolved, cancelled, timeout, or range break.
+        }
       });
 
       // -------------------------------------------------------------------------
@@ -1930,6 +3656,245 @@
       });
 
       ui.toggleStateBtn.addEventListener('click', toggleAgentState);
+
+      // -------------------------------------------------------------------------
+      // Lo-fi procedural audio — corruption-responsive
+      // -------------------------------------------------------------------------
+      const lofi = {
+        ctx: null,
+        masterGain: null,
+        started: false,
+        bpm: 75,
+        targetBpm: 75,
+        nextBeatAt: 0,
+        beatIndex: 0,
+        barIndex: 0,
+        chordIndex: 0,
+        filterNode: null,
+        reverbGain: null,
+        convolver: null,
+        compressor: null,
+        vinylNoise: null,
+        vinylGain: null,
+        subBass: null,
+        subGain: null,
+      };
+
+      const LOFI_CHORDS = [
+        [60, 64, 67, 72],
+        [65, 69, 72, 77],
+        [62, 65, 69, 74],
+        [67, 71, 74, 79],
+        [63, 67, 70, 75],
+        [58, 62, 65, 70],
+      ];
+
+      const LOFI_BASS_PATTERN = [0, -1, 0, -1, 0, -1, 0, 7];
+
+      function midiToFreq(midi) {
+        return 440 * Math.pow(2, (midi - 69) / 12);
+      }
+
+      function createImpulse(actx, duration, decay) {
+        const rate = actx.sampleRate;
+        const len = rate * duration;
+        const buf = actx.createBuffer(2, len, rate);
+        for (let ch = 0; ch < 2; ch++) {
+          const data = buf.getChannelData(ch);
+          for (let i = 0; i < len; i++) {
+            data[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, decay);
+          }
+        }
+        return buf;
+      }
+
+      function initLofi() {
+        if (lofi.started) return;
+        const actx = new (window.AudioContext || window.webkitAudioContext)();
+        lofi.ctx = actx;
+        lofi.started = true;
+
+        lofi.compressor = actx.createDynamicsCompressor();
+        lofi.compressor.threshold.value = -18;
+        lofi.compressor.knee.value = 12;
+        lofi.compressor.ratio.value = 4;
+        lofi.compressor.connect(actx.destination);
+
+        lofi.masterGain = actx.createGain();
+        lofi.masterGain.gain.value = 0.28;
+        lofi.masterGain.connect(lofi.compressor);
+
+        lofi.filterNode = actx.createBiquadFilter();
+        lofi.filterNode.type = 'lowpass';
+        lofi.filterNode.frequency.value = 2800;
+        lofi.filterNode.Q.value = 1.2;
+        lofi.filterNode.connect(lofi.masterGain);
+
+        lofi.convolver = actx.createConvolver();
+        lofi.convolver.buffer = createImpulse(actx, 1.8, 2.5);
+        lofi.reverbGain = actx.createGain();
+        lofi.reverbGain.gain.value = 0.3;
+        lofi.convolver.connect(lofi.reverbGain);
+        lofi.reverbGain.connect(lofi.masterGain);
+
+        const noiseLen = actx.sampleRate * 2;
+        const noiseBuf = actx.createBuffer(1, noiseLen, actx.sampleRate);
+        const noiseData = noiseBuf.getChannelData(0);
+        for (let i = 0; i < noiseLen; i++) {
+          noiseData[i] = (Math.random() * 2 - 1) * 0.015;
+        }
+        lofi.vinylNoise = actx.createBufferSource();
+        lofi.vinylNoise.buffer = noiseBuf;
+        lofi.vinylNoise.loop = true;
+        lofi.vinylGain = actx.createGain();
+        lofi.vinylGain.gain.value = 0.6;
+        lofi.vinylNoise.connect(lofi.vinylGain);
+        lofi.vinylGain.connect(lofi.masterGain);
+        lofi.vinylNoise.start();
+
+        lofi.subBass = actx.createOscillator();
+        lofi.subBass.type = 'sine';
+        lofi.subBass.frequency.value = 0;
+        lofi.subGain = actx.createGain();
+        lofi.subGain.gain.value = 0;
+        lofi.subBass.connect(lofi.subGain);
+        lofi.subGain.connect(lofi.masterGain);
+        lofi.subBass.start();
+
+        lofi.nextBeatAt = actx.currentTime + 0.1;
+      }
+
+      function playLofiChordHit(time, chord, velocity) {
+        const actx = lofi.ctx;
+        const detuneCents = (Math.random() - 0.5) * 12;
+
+        for (let i = 0; i < chord.length; i++) {
+          const osc = actx.createOscillator();
+          osc.type = i < 2 ? 'triangle' : 'sine';
+          osc.frequency.value = midiToFreq(chord[i]);
+          osc.detune.value = detuneCents + (Math.random() - 0.5) * 8;
+
+          const noteGain = actx.createGain();
+          const vol = velocity * (0.08 + Math.random() * 0.03) * (i === 0 ? 1.1 : 0.7);
+          noteGain.gain.setValueAtTime(0, time);
+          noteGain.gain.linearRampToValueAtTime(vol, time + 0.015);
+          noteGain.gain.exponentialRampToValueAtTime(0.001, time + 0.8 + Math.random() * 0.3);
+
+          osc.connect(noteGain);
+          noteGain.connect(lofi.filterNode);
+          noteGain.connect(lofi.convolver);
+
+          osc.start(time);
+          osc.stop(time + 1.2);
+        }
+      }
+
+      function playLofiKick(time) {
+        const actx = lofi.ctx;
+        const osc = actx.createOscillator();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(150, time);
+        osc.frequency.exponentialRampToValueAtTime(40, time + 0.12);
+        const g = actx.createGain();
+        g.gain.setValueAtTime(0.22, time);
+        g.gain.exponentialRampToValueAtTime(0.001, time + 0.25);
+        osc.connect(g);
+        g.connect(lofi.filterNode);
+        osc.start(time);
+        osc.stop(time + 0.3);
+      }
+
+      function playLofiHat(time, open) {
+        const actx = lofi.ctx;
+        const bufLen = actx.sampleRate * (open ? 0.15 : 0.05);
+        const buf = actx.createBuffer(1, bufLen, actx.sampleRate);
+        const d = buf.getChannelData(0);
+        for (let i = 0; i < bufLen; i++) d[i] = (Math.random() * 2 - 1);
+        const src = actx.createBufferSource();
+        src.buffer = buf;
+        const bp = actx.createBiquadFilter();
+        bp.type = 'highpass';
+        bp.frequency.value = open ? 6000 : 8000;
+        const g = actx.createGain();
+        g.gain.setValueAtTime(open ? 0.06 : 0.04, time);
+        g.gain.exponentialRampToValueAtTime(0.001, time + (open ? 0.12 : 0.04));
+        src.connect(bp);
+        bp.connect(g);
+        g.connect(lofi.filterNode);
+        src.start(time);
+      }
+
+      function scheduleLofiBeats() {
+        if (!lofi.started) return;
+        const actx = lofi.ctx;
+        const now = actx.currentTime;
+        const lookAhead = 0.15;
+
+        while (lofi.nextBeatAt < now + lookAhead) {
+          const t = lofi.nextBeatAt;
+          const beat = lofi.beatIndex % 8;
+          const bar = lofi.barIndex;
+
+          if (beat === 0 || beat === 4) playLofiKick(t);
+          if (beat % 2 === 1) playLofiHat(t, beat === 3 || beat === 7);
+          else playLofiHat(t, false);
+
+          if (beat === 0) {
+            lofi.chordIndex = bar % LOFI_CHORDS.length;
+            const chord = LOFI_CHORDS[lofi.chordIndex];
+            const corruption01 = (sessionState.corruption || 0) / 100;
+            const velocity = 0.7 + corruption01 * 0.3;
+            playLofiChordHit(t, chord, velocity);
+          }
+
+          if (beat === 4) {
+            const chord = LOFI_CHORDS[lofi.chordIndex];
+            playLofiChordHit(t, chord, 0.35);
+          }
+
+          const bassNote = LOFI_BASS_PATTERN[beat];
+          if (bassNote >= 0) {
+            const root = LOFI_CHORDS[lofi.chordIndex][0] - 12;
+            lofi.subBass.frequency.setValueAtTime(midiToFreq(root + bassNote), t);
+            lofi.subGain.gain.setValueAtTime(0.14, t);
+            lofi.subGain.gain.exponentialRampToValueAtTime(0.001, t + 0.3);
+          }
+
+          const secPerBeat = 60 / lofi.bpm;
+          lofi.nextBeatAt += secPerBeat;
+          lofi.beatIndex++;
+          if (beat === 7) lofi.barIndex++;
+        }
+      }
+
+      function updateLofiAudio() {
+        if (!lofi.started) return;
+
+        const corruption = sessionState.corruption || 0;
+        lofi.targetBpm = 70 + corruption * 0.6;
+        lofi.bpm += (lofi.targetBpm - lofi.bpm) * 0.02;
+
+        const filterTarget = 3200 - corruption * 18;
+        lofi.filterNode.frequency.value += (filterTarget - lofi.filterNode.frequency.value) * 0.03;
+
+        lofi.vinylGain.gain.value = 0.5 + corruption * 0.012;
+
+        const reverbTarget = 0.25 + corruption * 0.004;
+        lofi.reverbGain.gain.value += (reverbTarget - lofi.reverbGain.gain.value) * 0.02;
+
+        scheduleLofiBeats();
+      }
+
+      function resumeLofiOnInteraction() {
+        if (!lofi.started) {
+          initLofi();
+        } else if (lofi.ctx && lofi.ctx.state === 'suspended') {
+          lofi.ctx.resume();
+        }
+      }
+
+      window.addEventListener('keydown', resumeLofiOnInteraction, { once: false });
+      window.addEventListener('click', resumeLofiOnInteraction, { once: false });
 
       // -------------------------------------------------------------------------
       // Resize handling
@@ -1958,14 +3923,19 @@
       const yAxis = new THREE.Vector3(0, 1, 0);
 
       function updateLocalMovement(delta) {
+        const localTask = getLocalClaimedTask();
+        const movementLockedTypes = ['sequence', 'gradient', 'packer', 'beam', 'embed'];
+        const sequenceCapture = !!localTask && movementLockedTypes.includes(localTask.type) && localTask.phase === 'active';
         localPlayer.moveDir.set(0, 0, 0);
         const spikeActive = performance.now() < sessionState.temperatureSpikeUntil;
         const speedMultiplier = spikeActive ? 1.1 : 1;
 
-        if (keys.KeyW) localPlayer.moveDir.z -= 1;
-        if (keys.KeyS) localPlayer.moveDir.z += 1;
-        if (keys.KeyA) localPlayer.moveDir.x -= 1;
-        if (keys.KeyD) localPlayer.moveDir.x += 1;
+        if (!sequenceCapture) {
+          if (keys.KeyW) localPlayer.moveDir.z -= 1;
+          if (keys.KeyS) localPlayer.moveDir.z += 1;
+          if (keys.KeyA) localPlayer.moveDir.x -= 1;
+          if (keys.KeyD) localPlayer.moveDir.x += 1;
+        }
 
         camera.getWorldDirection(cameraForwardFlat);
         cameraForwardFlat.y = 0;
@@ -2088,9 +4058,17 @@
         // Distance readout for poison range awareness.
         const dist = getDistanceToPrompt(localPlayer);
         const anchorDist = getDistanceToAnchor(localPlayer);
+        const nearestStation = getNearestStation(localPlayer);
+        const stationHint = nearestStation
+          ? `${nearestStation.stationId} ${nearestStation.distance.toFixed(2)}u ${getStationState(nearestStation.stationId).toUpperCase()}`
+          : 'NO STATION';
         ui.distanceLabel.textContent =
           localPlayer.roleIndex === 0 ? `${dist.toFixed(2)}u to prompt` : `${dist.toFixed(2)}u prompt / ${anchorDist.toFixed(2)}u branch`;
         ui.distanceLabel.className = `value ${dist <= 3.25 || anchorDist <= 2.4 ? 'status-node' : ''}`;
+        ui.stationStatusLabel.textContent = stationHint;
+        ui.stationStatusLabel.className = `value ${
+          nearestStation && nearestStation.distance <= TASK_STATION_RANGE ? 'status-node' : 'status-warn'
+        }`;
 
         updateMeter(ui.budgetFill, ui.budgetLabel, sessionState.contextBudget);
         updateMeter(ui.corruptionFill, ui.corruptionLabel, sessionState.corruption);
@@ -2100,6 +4078,8 @@
         for (const remote of remotePlayers.values()) {
           updatePlayerGraph(remote, elapsed);
         }
+
+        updateStationVisuals(elapsed);
 
         // Parallax stars.
         stars.rotation.y = elapsed * 0.01;
@@ -2127,6 +4107,7 @@
         updateAuthoritySimulation(delta, elapsed);
         updateCamera();
         updateWorldFX(elapsed);
+        updateLofiAudio();
         broadcastLocalState(false);
         render(elapsed);
       }
